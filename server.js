@@ -9,6 +9,8 @@ const { ocrImageUrl } = require('./ocr');
 
 const PORT = process.env.PORT || 3000;
 
+
+
 const app = express();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
 const jobs = {}; // jobId -> { total, done, status, file, error }

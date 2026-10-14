@@ -36,6 +36,8 @@
 const f = document.getElementById('f'), btn = document.getElementById('btn'),
       bar = document.getElementById('bar'), fill = bar.firstElementChild, msg = document.getElementById('msg');
 
+
+      
 f.onsubmit = async (e) => {
   e.preventDefault();
   btn.disabled = true; msg.innerHTML = 'Uploading...'; bar.style.display = 'block'; fill.style.width = '0';
