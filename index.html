@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Courier OCR Extractor</title>
+<style>
+  body { font-family: Arial, sans-serif; margin: 40px 16px; background: #f4f4f9; }
+  .container { max-width: 600px; margin: 0 auto; background: #fff; padding: 24px; border-radius: 8px; box-shadow: 0 4px 8px rgba(0,0,0,.1); }
+  h2 { text-align: center; color: #333; margin-top: 0; }
+  form { display: flex; flex-direction: column; gap: 15px; }
+  input[type=file] { padding: 10px; border: 1px solid #ccc; border-radius: 4px; }
+  button { padding: 10px; background: #28a745; color: #fff; border: 0; border-radius: 4px; cursor: pointer; font-size: 16px; }
+  button:disabled { background: #999; cursor: default; }
+  .bar { height: 18px; background: #e9ecef; border-radius: 4px; overflow: hidden; margin-top: 20px; display: none; }
+  .bar div { height: 100%; width: 0; background: #28a745; transition: width .3s; }
+  #msg { margin-top: 15px; text-align: center; }
+  .success { padding: 15px; background: #d4edda; color: #155724; border-radius: 4px; }
+  .success a { color: #155724; font-weight: bold; }
+  .error { padding: 15px; background: #f8d7da; color: #721c24; border-radius: 4px; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h2>Image URLs → Excel</h2>
+  <p style="text-align:center">Upload an <strong>.xlsx</strong> or <strong>.csv</strong> file that has image URLs. The text in each image is read on this computer (no API).</p>
+  <form id="f">
+    <input type="file" name="file" accept=".xlsx,.csv" required>
+    <label><input type="checkbox" name="debug" value="1"> Add raw OCR text column (debug)</label>
+    <button id="btn" type="submit">Process Images</button>
+  </form>
+  <div class="bar" id="bar"><div></div></div>
+  <div id="msg"></div>
+</div>
+<script>
+const f = document.getElementById('f'), btn = document.getElementById('btn'),
+      bar = document.getElementById('bar'), fill = bar.firstElementChild, msg = document.getElementById('msg');
+
+f.onsubmit = async (e) => {
+  e.preventDefault();
+  btn.disabled = true; msg.innerHTML = 'Uploading...'; bar.style.display = 'block'; fill.style.width = '0';
+  const fd = new FormData(f);
+  if (!f.debug.checked) fd.delete('debug');
+  const r = await fetch('/upload', { method: 'POST', body: fd }).then(r => r.json()).catch(() => ({ error: 'Upload failed' }));
+  if (r.error) { msg.innerHTML = `<div class="error">${r.error}</div>`; btn.disabled = false; return; }
+
+  const poll = setInterval(async () => {
+    const s = await fetch('/status/' + r.id).then(r => r.json());
+    fill.style.width = (s.done / s.total * 100) + '%';
+    msg.textContent = `Processing ${s.done} / ${s.total} images...`;
+    if (s.status === 'done') {
+      clearInterval(poll); btn.disabled = false;
+      msg.innerHTML = `<div class="success">Done! Your Excel file is downloading.</div>`;
+      window.location.href = '/download/' + r.id; // one-time download, file is not kept on server
+    } else if (s.status !== 'running') {
+      clearInterval(poll); btn.disabled = false;
+      msg.innerHTML = `<div class="error">Error: ${s.error || 'job lost'}</div>`;
+    }
+  }, 1000);
+};
+</script>
+</body>
+</html>
