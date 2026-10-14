@@ -1,4 +1,6 @@
 // ocr.js - local OCR (no external API). Uses tesseract.js + sharp.
+// Works for different courier image formats: the photo is grey and the info
+// text is printed in a colour (yellow, red, ...), so we keep only coloured pixels.
 const sharp = require('sharp');
 const Tesseract = require('tesseract.js');
 const path = require('path');
@@ -32,39 +34,56 @@ async function downloadImage(url) {
   return Buffer.from(await res.arrayBuffer());
 }
 
-// Crop the top-left text overlay and turn yellow text into black-on-white.
+// Turn coloured overlay text into black-on-white, crop to it and scale it to a good size.
 async function preprocess(buffer) {
-  const img = sharp(buffer);
-  const meta = await img.metadata();
-  const cropW = Math.round(meta.width * 0.42);
-  const cropH = Math.round(meta.height * 0.45);
+  const { data, info } = await sharp(buffer).removeAlpha().raw().toBuffer({ resolveWithObject: true });
+  const W = info.width, H = info.height;
 
-  const { data, info } = await sharp(buffer)
-    .extract({ left: 0, top: 0, width: cropW, height: cropH })
-    .removeAlpha()
-    .raw()
-    .toBuffer({ resolveWithObject: true });
-
-  const out = Buffer.alloc(info.width * info.height);
-  for (let i = 0, p = 0; p < out.length; i += 3, p++) {
+  // 1. mask of "coloured" pixels (grey photo pixels have R≈G≈B)
+  const mask = new Uint8Array(W * H);
+  for (let i = 0, p = 0; p < mask.length; i += 3, p++) {
     const r = data[i], g = data[i + 1], b = data[i + 2];
-    // yellow-ish: strong red & green, much weaker blue
-    const isText = r > 120 && g > 100 && r - b > 60 && g - b > 40;
-    out[p] = isText ? 0 : 255;
+    const max = Math.max(r, g, b), min = Math.min(r, g, b);
+    if (max > 110 && max - min > 70) mask[p] = 1;
   }
 
-  // scale down very large images a bit (text is huge) and smooth edges
-  const targetW = Math.min(info.width, 1600);
-  return sharp(out, { raw: { width: info.width, height: info.height, channels: 1 } })
-    .resize({ width: targetW })
-    .median(3)
+  // 2. find the text block: rows / columns that contain enough coloured pixels
+  const rowCount = new Uint32Array(H), colCount = new Uint32Array(W);
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) if (mask[y * W + x]) { rowCount[y]++; colCount[x]++; }
+  const minHits = 3;
+  let top = rowCount.findIndex(c => c >= minHits);
+  if (top < 0) throw new Error('No coloured text found in image');
+  let bottom = H - 1; while (bottom > top && rowCount[bottom] < minHits) bottom--;
+  let left = colCount.findIndex(c => c >= minHits);
+  let right = W - 1; while (right > left && colCount[right] < minHits) right--;
+
+  // 3. estimate text line height -> scale so letters are ~40px tall
+  const lineHeights = [];
+  let run = 0;
+  for (let y = top; y <= bottom + 1; y++) {
+    if (y <= bottom && rowCount[y] >= minHits) run++;
+    else { if (run > 4) lineHeights.push(run); run = 0; }
+  }
+  lineHeights.sort((a, b) => a - b);
+  const lineH = lineHeights[Math.floor(lineHeights.length / 2)] || 30;
+  const scale = Math.max(0.4, Math.min(4, 40 / lineH));
+
+  const pad = Math.round(lineH);
+  top = Math.max(0, top - pad); left = Math.max(0, left - pad);
+  bottom = Math.min(H - 1, bottom + pad); right = Math.min(W - 1, right + pad);
+  const cw = right - left + 1, ch = bottom - top + 1;
+
+  const out = Buffer.alloc(cw * ch);
+  for (let y = 0; y < ch; y++) for (let x = 0; x < cw; x++) {
+    out[y * cw + x] = mask[(y + top) * W + (x + left)] ? 0 : 255;
+  }
+
+  return sharp(out, { raw: { width: cw, height: ch, channels: 1 } })
+    .resize({ width: Math.round(cw * scale), kernel: 'lanczos3' })
+    .blur(scale > 1.5 ? 0.6 : 0.3) // smooth the jagged edges after scaling
+    .threshold(160)
     .png()
     .toBuffer();
-}
-
-function pick(re, text) {
-  const m = text.match(re);
-  return m ? m[1].trim() : '';
 }
 
 // 'Hyderabad Medchal GW (Telangana)' -> 'Hyderabad_Medchal_GW (Telangana)'
@@ -75,25 +94,37 @@ function cleanLocation(s) {
   return s;
 }
 
+// Label variations seen so far:
+//   Location: / LOCATION CODE :        AWB No: / AWB_NO : / AWB_No:
+//   Length: / LENGTH(cm) :             R.Vol.: / Volume:
+//   Weight: / WEIGHT(Kg) :             Time: / DATETIME :
+//   ID : / Sorter_ID:
 function parseText(raw) {
   const lines = raw.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
-  const line = (key) => lines.find(l => key.test(l)) || '';
+  // Text after the label. OCR sometimes reads ':' as '.', '*' or drops it, so strip any of those.
+  const value = (label) => {
+    for (const l of lines) {
+      const m = l.match(label);
+      if (m) return l.slice(m.index + m[0].length).replace(/^[\s:;.*,'"=~_-]+/, '').trim();
+    }
+    return '';
+  };
   const num = (s) => { const m = s.replace(/,/g, '.').match(/(\d+(?:\.\d+)?)/); return m ? m[1] : ''; };
-  const afterColon = (s) => s.replace(/^[^:;]*[:;]\s*/, '').trim();
 
-  const locLine = line(/locat/i);
-  const awbLine = line(/awb/i);
-  const timeLine = line(/time/i);
+  const awb = value(/^\W*AWB[\W_]*N[O0]\.?/i);
+  const timeText = value(/^\W*(date\s*)?time/i);
+  const time = timeText.match(/(\d{1,2}[-\/.]\d{1,2}[-\/.]\d{2,4})[\s.]+(\d{1,2}:\d{2}(?::\d{2})?(?:\s*[AP]M)?)/i);
 
   return {
-    location: cleanLocation(afterColon(locLine)),
-    awb: (awbLine.replace(/[OoQ]/g, '0').replace(/[Il|]/g, '1').match(/(\d{8,})/) || [, ''])[1],
-    length: num(afterColon(line(/length/i))),
-    width: num(afterColon(line(/width/i))),
-    height: num(afterColon(line(/height/i))),
-    rvol: num(afterColon(line(/vol/i))),
-    weight: num(afterColon(line(/weight/i))),
-    time: pick(/(\d{2}[-\/.]\d{2}[-\/.]\d{2,4}\s+\d{1,2}:\d{2}(?::\d{2})?)/, timeLine) || afterColon(timeLine),
+    location: cleanLocation(value(/^\W*location(\s*code)?/i)),
+    awb: (awb.replace(/[OoQD]/g, '0').replace(/[Il|]/g, '1').replace(/\s/g, '').match(/(\d{8,})/) || [, ''])[1],
+    length: num(value(/^\W*length\s*(\(\s*cm\s*\))?/i)),
+    width: num(value(/^\W*width\s*(\(\s*cm\s*\))?/i)),
+    height: num(value(/^\W*height\s*(\(\s*cm\s*\))?/i)),
+    rvol: num(value(/^\W*(r\W*)?vol(ume)?\.?/i)),
+    weight: num(value(/^\W*weight\s*(\(\s*kg\s*\))?/i)),
+    time: time ? time[1] + ' ' + time[2] : timeText,
+    machineId: value(/^\W*(sorter[\W_]*)?id\b/i),
   };
 }
 
@@ -105,4 +136,4 @@ async function ocrImageUrl(url) {
   return { raw: data.text, fields: parseText(data.text) };
 }
 
-module.exports = { ocrImageUrl, closeWorker, parseText };
+module.exports = { ocrImageUrl, closeWorker, parseText, preprocess };

@@ -49,12 +49,14 @@ async function runJob(id, urls, debug) {
     { header: 'R.Vol (cubic)', key: 'rvol', width: 13 },
     { header: 'Weight (kg)', key: 'weight', width: 12 },
     { header: 'Time', key: 'time', width: 24 },
+    { header: 'ID / Sorter ID', key: 'machineId', width: 14 },
     { header: 'Status', key: 'status', width: 20 },
   ];
   if (debug) cols.push({ header: 'Raw OCR Text', key: 'raw', width: 60 });
   ws.columns = cols;
   ws.getRow(1).font = { bold: true };
   ws.getColumn('awb').numFmt = '@'; // keep AWB as text so Excel doesn't turn it into 5.3E+13
+  ws.getColumn('machineId').numFmt = '@'; // keep '04' as text
 
   const toNum = (s) => (s === '' || isNaN(Number(s)) ? s : Number(s));
 

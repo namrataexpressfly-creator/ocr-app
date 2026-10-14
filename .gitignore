@@ -1,0 +1,10 @@
+/node_modules
+package-lock.json
+.env
+.DS_Store
+.eslintcache
+logs
+steps.txt
+seedData/OrdersdataJson
+seedData/TempOrdersdataJson
+seedData/pincodeDetails
