@@ -5,11 +5,9 @@ const multer = require('multer');
 const ExcelJS = require('exceljs');
 const path = require('path');
 const { Readable } = require('stream');
-const { ocrImageUrl } = require('./ocr');
+const { ocrImageUrl, closeWorker } = require('./ocr');
 
 const PORT = process.env.PORT || 3000;
-
-
 
 const app = express();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
@@ -51,33 +49,42 @@ async function runJob(id, urls, debug) {
     { header: 'R.Vol (cubic)', key: 'rvol', width: 13 },
     { header: 'Weight (kg)', key: 'weight', width: 12 },
     { header: 'Time', key: 'time', width: 24 },
-    { header: 'ID / Sorter ID', key: 'machineId', width: 14 },
     { header: 'Status', key: 'status', width: 20 },
   ];
   if (debug) cols.push({ header: 'Raw OCR Text', key: 'raw', width: 60 });
   ws.columns = cols;
   ws.getRow(1).font = { bold: true };
   ws.getColumn('awb').numFmt = '@'; // keep AWB as text so Excel doesn't turn it into 5.3E+13
-  ws.getColumn('machineId').numFmt = '@'; // keep '04' as text
 
   const toNum = (s) => (s === '' || isNaN(Number(s)) ? s : Number(s));
 
-  for (const url of urls) {
-    let row = { url, status: 'OK' };
-    try {
-      const { raw, fields } = await ocrImageUrl(url);
-      row = {
-        ...row, ...fields,
-        length: toNum(fields.length), width: toNum(fields.width), height: toNum(fields.height),
-        rvol: toNum(fields.rvol), weight: toNum(fields.weight), raw,
-      };
-      if (!fields.awb && !fields.weight) row.status = 'Text not found';
-    } catch (e) {
-      row.status = 'Error: ' + e.message;
+  // Process several images at the same time (OCR_CONCURRENCY workers, default = CPU cores up to 6).
+  const CONC = Math.max(1, Number(process.env.OCR_CONCURRENCY) || Math.min(require('os').cpus().length, 6));
+  const rows = new Array(urls.length);
+  let next = 0;
+  async function lane() {
+    while (next < urls.length) {
+      const idx = next++;
+      const url = urls[idx];
+      let row = { url, status: 'OK' };
+      try {
+        const { raw, fields } = await ocrImageUrl(url);
+        row = {
+          ...row, ...fields,
+          length: toNum(fields.length), width: toNum(fields.width), height: toNum(fields.height),
+          rvol: toNum(fields.rvol), weight: toNum(fields.weight), raw,
+        };
+        if (!fields.awb && !fields.weight) row.status = 'Text not found';
+      } catch (e) {
+        row.status = 'Error: ' + e.message;
+      }
+      rows[idx] = row;
+      job.done++;
     }
-    ws.addRow(row);
-    job.done++;
   }
+  await Promise.all(Array.from({ length: Math.min(CONC, urls.length) }, lane));
+  rows.forEach((r) => ws.addRow(r)); // keep the original order
+  await closeWorker();
 
   // Keep the Excel in memory only - nothing is saved on disk.
   job.buffer = await wb.xlsx.writeBuffer();
